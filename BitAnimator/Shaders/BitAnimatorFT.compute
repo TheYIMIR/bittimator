@@ -1,0 +1,524 @@
+﻿
+// Copyright © 2021 Leviant. 
+// E-mail: leviant@yandex.ru  
+// Discord: Leviant#8796
+// PayPal: https://paypal.me/LeviantTech
+// License: http://opensource.org/licenses/MIT
+// Version: 1.3 (01.10.2021)
+
+#pragma enable_d3d11_debug_symbols
+#pragma kernel FFT_Init					
+#pragma kernel FFT_Part					
+#pragma kernel FFT_Execute
+#pragma kernel IFFT_Execute
+#pragma kernel IFFT_Part				
+#pragma kernel DFT_Execute
+#pragma kernel DFT_BPM
+#pragma kernel AbsSpectrum
+#pragma kernel ComputeResolve
+#pragma kernel ResolveMultisamplesKernel
+#pragma kernel DolphChebyshevWindow	
+#pragma kernel CreateWindow
+
+#define TILE_DIM 32
+#define BLOCK_ROWS 8
+#define MAX_WORKSIZE 1024
+
+#include "Utils.hlsl"
+
+struct SwapComplex
+{
+	float2 complex[2];
+};
+Buffer<float> _Window;
+Buffer<float> _Input;
+RWBuffer<float> _Output;
+RWBuffer<float2> _ComplexOutput;
+RWStructuredBuffer<SwapComplex> _Buffer;
+
+groupshared float2 values[MAX_WORKSIZE][2];
+groupshared float bpms[256];
+groupshared float reductionSums[MAX_WORKSIZE];
+
+uniform uint3 _GridSize;
+uniform uint _N;
+uniform uint3 _GridOffset;
+uniform uint _Source;
+uniform uint _FFTWindow;
+uniform uint _Frequency;
+uniform uint _Multisamples;
+uniform uint _SampleStep;
+uniform uint _BufferStep;
+uniform float _MaximumValues;
+uniform float _Scale;
+
+[numthreads(64, 1, 1)]
+void FFT_Init(uint3 id : SV_DispatchThreadID)
+{
+	uint i = id.y * _FFTWindow + id.x;
+	uint x = ((id.y + _GridOffset.y) * _FFTWindow / _Multisamples + id.x) * _SampleStep / _BufferStep + _GridOffset.x;
+	if (i % _BufferStep == 0)
+		_Buffer[i].complex[0] = float2(_Input[x] * _Window[id.x / _BufferStep], 0);
+	else
+		_Buffer[i].complex[0] = 0;
+}
+[numthreads(64, 1, 1)]
+void FFT_Part(uint3 id : SV_DispatchThreadID)
+{
+	uint i = id.x;
+
+	uint base = (i / _N) * (_N / 2);
+	uint offs = i % (_N / 2);
+
+	uint i0 = base + offs;
+	uint i1 = i0 + _FFTWindow / 2;
+
+	float2 v0 = _Buffer[id.y * _FFTWindow + i0].complex[_Source];
+	float2 v1 = _Buffer[id.y * _FFTWindow + i1].complex[_Source];
+
+	float a = -2.0f * UNITY_PI * float(i) / _N;
+	float2 sc = float2(cos(a), sin(a));
+
+	_Buffer[id.y * _FFTWindow + i].complex[_Source ^ 1] = v0 + complexMultiply(v1, sc);
+}
+[numthreads(64, 1, 1)]
+void IFFT_Part(uint3 id : SV_DispatchThreadID)
+{
+	uint i = id.x;
+
+	uint base = (i / _N) * (_N / 2);
+	uint offs = i % (_N / 2);
+
+	uint i0 = base + offs;
+	uint i1 = i0 + _FFTWindow / 2;
+
+	float2 v0 = _Buffer[id.y * _FFTWindow + i0].complex[_Source];
+	float2 v1 = _Buffer[id.y * _FFTWindow + i1].complex[_Source];
+
+	float a = 2.0f * UNITY_PI * float(i) / _N;
+	float2 sc = float2(cos(a), sin(a));
+
+	_Buffer[id.y * _FFTWindow + i].complex[_Source ^ 1] = v0 + complexMultiply(v1, sc);
+}
+
+void fft_pass(uint i, uint ns, uint source)
+{
+	uint base = (i / ns) * (ns / 2);
+	uint offs = i % (ns / 2);
+
+	uint i0 = base + offs;
+	uint i1 = i0 + _FFTWindow / 2;
+
+	float2 v0 = values[i0][source];
+	float2 v1 = values[i1][source];
+
+	float a = -2.0f * UNITY_PI * float(i) / ns;
+	float2 sc = float2(cos(a), sin(a));
+
+	values[i][source ^ 1] = v0 + complexMultiply(v1, sc);
+}
+
+[numthreads(MAX_WORKSIZE, 1, 1)]
+void FFT_Execute(uint3 id : SV_DispatchThreadID, uint localID : SV_GroupIndex)
+{
+	
+	uint thread = id.y * _FFTWindow + id.x;
+	if (localID < _FFTWindow)
+		values[localID][0] = _Buffer[thread].complex[_Source];
+	else
+		values[localID][0] = 0;
+	GroupMemoryBarrierWithGroupSync();
+
+	uint source = 0;
+	for (uint n = 2; n <= _FFTWindow; n *= 2)
+	{
+		fft_pass(localID, n, source);
+		source ^= 1;
+		GroupMemoryBarrierWithGroupSync();
+	}
+	if (localID < _FFTWindow)
+	{
+		_Buffer[thread].complex[_Source ^ 1] = values[localID][source];
+	}
+}
+
+void ifft_pass(uint i, uint ns, uint source)
+{
+	uint base = (i / ns) * (ns / 2);
+	uint offs = i % (ns / 2);
+
+	uint i0 = base + offs;
+	uint i1 = i0 + _FFTWindow / 2;
+
+	float2 v0 = values[i0][source];
+	float2 v1 = values[i1][source];
+
+	float a = 2.0f * UNITY_PI * float(i) / ns;
+	float2 sc = float2(cos(a), sin(a));
+
+	values[i][source ^ 1] = v0 + complexMultiply(v1, sc);
+}
+
+[numthreads(MAX_WORKSIZE, 1, 1)]
+void IFFT_Execute(uint3 id : SV_DispatchThreadID)
+{
+	uint batches = MAX_WORKSIZE / _FFTWindow;
+	uint thread = id.y * MAX_WORKSIZE + id.x;
+	bool inRange = thread < _FFTWindow * _GridSize.y;
+
+	values[id.x][0] = inRange ? _Buffer[thread].complex[_Source] : 0;
+	GroupMemoryBarrierWithGroupSync();
+
+	uint source = 0;
+	for (uint n = 2; n <= _FFTWindow; n *= 2)
+	{
+		ifft_pass(id.x, n, source);
+		source ^= 1;
+		GroupMemoryBarrierWithGroupSync();
+	}
+	if(inRange)
+		_Output[thread] = values[id.x][source].x;
+}
+
+[numthreads(64, 1, 1)]
+void DFT_Execute(uint3 id : SV_DispatchThreadID)
+{
+	uint i = id.x;
+	float2 integral = 0;
+	float a1 = 2.0 * UNITY_PI * i / _FFTWindow;
+	float w = _Window[id.x];
+
+	for (uint t = 0; t < _FFTWindow; t++)
+	{
+		float2 k;
+		sincos(a1 * t, k.x, k.y);
+		integral += k * w * _Input[(id.y + _GridOffset.y) * _FFTWindow / _Multisamples + t + _GridOffset.x];
+	}
+	if (i <= _FFTWindow / 2)
+	{
+		float volume = sqrt(dot(integral, integral) / 2.0) * 2.0 / _FFTWindow;
+		_Output[id.y * _FFTWindow / 2 + i] = volume;
+	}
+}
+
+groupshared float2 dftPart[MAX_WORKSIZE];
+[numthreads(MAX_WORKSIZE, 1, 1)]
+void DFT_BPM(uint3 groupID : SV_GroupID, uint localID : SV_GroupIndex)  //For _BPM analize
+{
+	//256 _BPM range [40..295]
+	const float minBPM = 40.0;
+	float2 integral = 0;
+	
+	float chunksPerMinute = (float)_Frequency / _FFTWindow * _Multisamples * 60.0;
+	float a1 = 2.0 * UNITY_PI * (groupID.x + minBPM) / chunksPerMinute;
+	/*for (uint t = localID; t < _GridSize.x; t += MAX_WORKSIZE)
+	{
+		float2 k = float2(cos(a1 * t), sin(a1 * t));
+		integral += k * _Input[t];
+	}*/
+	uint iterations = (_GridSize.x - 1) / MAX_WORKSIZE + 1;
+
+	float2 k = float2(cos(a1), sin(a1));
+	dftPart[localID] = k * _Input[localID];
+	//sum iterations if band size > 1024 
+	for (uint j = 1; j < iterations; j++)
+	{
+		uint idx = MAX_WORKSIZE * j + localID;
+		k = float2(cos(a1 * idx), sin(a1 * idx));
+		if (idx < _GridSize.x)
+			dftPart[localID] += k * _Input[idx];
+	}
+	
+	//dftPart[localID] = integral;
+
+	for (uint offset = MAX_WORKSIZE / 2; offset != 0; offset /= 2)
+	{
+		GroupMemoryBarrierWithGroupSync();	// wait for all other work-items to finish previous iteration.
+		if (localID < offset)
+			dftPart[localID] += dftPart[localID + offset];
+	}
+
+	if (localID == 0)	// the root of the reduction subtree
+	{
+		_Output[groupID.x * 2] = length(dftPart[0]) / _GridSize.x;
+		_Output[groupID.x * 2 + 1] = atan2(dftPart[0].y, dftPart[0].x);
+	}
+	
+}
+
+[numthreads(16, 16, 1)]
+void IDFT(uint3 id : SV_DispatchThreadID)
+{
+	float a = 2.0 * UNITY_PI * id.x / _FFTWindow;
+	float2 c = 0;
+	for (uint x = 0; x < _FFTWindow; x++)
+	{
+		float2 sc;
+		float2 v = _Input[x];
+		sincos(a * x, sc.y, sc.x);
+		c += complexMultiply(v, sc);
+	}
+	_Output[id.x] = complexAbs(c / _FFTWindow);
+}
+
+[numthreads(64, 1, 1)]
+void AbsSpectrum(uint3 id : SV_DispatchThreadID)
+{
+	const uint EnergyCorrection = 4;
+	const uint _CalculateFons = 8;
+	const uint RemapVolume = 32;
+	const uint IFFT_Pass_mode = 1024;
+
+	float2 v = _Buffer[id.y * _FFTWindow + id.x].complex[_Source] * _Scale / _FFTWindow;
+	if (_N & IFFT_Pass_mode)
+	{
+		_Output[id.y * _FFTWindow + id.x] = v.x;
+	}
+	else
+	{
+		float volume = complexAbs(v / sqrt(_FFTWindow));
+		if (_N & EnergyCorrection)
+			volume *= ((id.x + 0.5) / (_FFTWindow / 2.0) * _Frequency - 1000.0) / 1000.0 + 1.0;
+		if (_N & _CalculateFons)
+			volume = getFons((id.x + 0.5) * _Frequency / _FFTWindow, volume);
+		_Output[id.y * _FFTWindow / 2 + id.x] = volume;
+	}
+}
+
+[numthreads(MAX_WORKSIZE, 1, 1)]
+void ComputeResolve(uint3 id : SV_DispatchThreadID, uint localID : SV_GroupIndex)
+{
+	uint partCount = _FFTWindow / _Multisamples;
+	//uint iterations = (partCount - 1) / MAX_WORKSIZE + 1;
+
+	uint base = (_FFTWindow - partCount) / 2 + partCount * id.y;
+	reductionSums[localID] = 0;
+	for (uint j = localID; j < partCount; j += MAX_WORKSIZE)
+	{
+		if (base + j < _FFTWindow)
+			reductionSums[localID] += _Window[base + j];
+	}
+
+	for (uint offset = MAX_WORKSIZE / 2; offset != 0; offset /= 2)
+	{
+		GroupMemoryBarrierWithGroupSync();
+		if (localID < offset)
+			reductionSums[localID] += reductionSums[localID + offset];
+
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (localID == 0)
+	{
+		//uint i = _Multisamples / 2 + id.y;
+		//_Output[_Multisamples / 2 + id.y] = reductionSums[0] / partCount;
+		//_Output[(_Multisamples & 0xFE) - i] = reductionSums[0] / partCount;
+		_Output[(_Multisamples & 0xFE) - id.y] = 0;
+		_Output[id.y] = reductionSums[0] / partCount;
+
+	}
+}
+
+[numthreads(1, 64, 1)]
+void ResolveMultisamplesKernel(uint3 id : SV_DispatchThreadID)
+{
+	float value = 0;
+	uint center = _Multisamples / 2;
+	uint wSize = center * 2 + 1;
+	if (id.y >= center && id.y < _GridSize.y - center)
+		for (uint s = 0; s < wSize; s++)
+		{
+			float w = _Window[center * wSize + s];
+			w = lerp(s == center ? _MaximumValues : 0.0, w, _Scale);
+			value += w * _Input[(id.y + s - center) * _GridSize.x + id.x];
+		}
+	/*else if(id.y < center)
+		for (uint s = 0; s < wSize; s++)
+		{
+			float w = _Window[id.y * wSize + s];
+			w = lerp(s == id.y ? 1.0 : 0.0, w, _Scale);
+			value += w * _Input[s * _GridSize.x + id.x];
+		}
+	else
+		for (uint s = 0; s < wSize; s++)
+		{
+			float w = _Window[(_Multisamples - (_GridSize.y - id.y)) * wSize + s];
+			w = lerp((wSize - s) == (_GridSize.y - id.y) ? 1.0 : 0.0, w, _Scale);
+			value += w * _Input[(_GridSize.y + s - wSize) * _GridSize.x + id.x];
+		}
+		*/
+	_Output[id.y * _GridSize.x + id.x] = value;
+}
+
+
+float acosh(float x) 
+{ 
+	return log(x + sqrt(x * x - 1.0f)); 
+}
+float cheby_poly(int n, float x) 
+{
+	if (abs(x) <= 1) 
+		return cos(n * acos(x));
+	else              
+		return cosh(n * acosh(x));
+}
+
+[numthreads(MAX_WORKSIZE, 1, 1)]
+void DolphChebyshevWindow(uint3 groupID : SV_GroupID, uint localID : SV_GroupIndex)
+{
+	/*
+	// calculate a chebyshev window of size _N, store coeffs in out as in Antoniou
+	//-out should be array of size _N
+	//-atten is the required sidelobe attenuation (e.g. if you want -60dB atten, use '60')
+
+	float atten = 40;
+	float M, n, sum = 0, max = 0;
+	float tg = pow(10, atten / 20);  // 1/r term [2], 10^gamma [2] 
+	float x0 = cosh((1.0 / (_FFTWindow - 1)) * acosh(tg));
+	M = (_FFTWindow - 1) / 2 + 0.5;
+	for (uint nn = 0; nn < (_FFTWindow / 2 + 1); nn++) 
+	{
+		n = nn - M;
+		sum = 0;
+		for (int i = 1; i <= M; i++) 
+		{
+			sum += cheby_poly(_FFTWindow - 1, x0 * cos(UNITY_PI * i / _FFTWindow)) * cos(2.0 * n * UNITY_PI * i / _FFTWindow);
+		}
+		_Output[nn] = tg + 2 * sum;
+		_Output[_FFTWindow - nn - 1] = _Output[nn];
+		if (_Output[nn] > max)
+			max = _Output[nn];
+	}
+	for (uint i = 0; i < _FFTWindow; i++) 
+		_Output[i] /= max; // normalise everything
+	*/
+
+	//another variant to compute window
+	float db = _Scale;
+	float d = pow(10.0, db / 20.0);
+	float acosh_db = acosh(d);
+	float m = _FFTWindow - 1;
+	float j = groupID.x;
+
+	reductionSums[localID] = 0;
+		
+	for (uint k = localID; k < _FFTWindow; k += MAX_WORKSIZE)
+	{
+		float t = UNITY_PI * (k - m * 0.5) / _FFTWindow;
+		float x = cosh(acosh_db / m) * cos(t);
+		float w = abs(x) <= 1.0 ? cos(m * acos(x)) : cosh(m * acosh(x));
+		reductionSums[localID] += w * cos(t * (j - m * 0.5) * 2);
+	}
+	for (uint offset = MAX_WORKSIZE / 2; offset != 0; offset /= 2)
+	{
+		GroupMemoryBarrierWithGroupSync();	// wait for all other work-items to finish previous iteration.
+		if (localID < offset)
+			reductionSums[localID] += reductionSums[localID + offset];
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if(localID == 0)
+		_Output[groupID.x] = reductionSums[0];
+}
+
+float SineExpansion(uint i, float c0, float c1 = 0, float c2 = 0, float c3 = 0, float c4 = 0, float c5 = 0, float c6 = 0, float c7 = 0, float c8 = 0, float c9 = 0, float c10 = 0)
+{
+	// z = 2 * pi * (0:_N-1)' / _N;   // Cosine Vector
+	float a = 2.0f * UNITY_PI * i / _FFTWindow;
+
+	float wc = c0;
+	wc += c1 * cos(a);
+	wc += c2 * cos(2.0f * a);
+	wc += c3 * cos(3.0f * a);
+	wc += c4 * cos(4.0f * a);
+	wc += c5 * cos(5.0f * a);
+	wc += c6 * cos(6.0f * a);
+	wc += c7 * cos(7.0f * a);
+	wc += c8 * cos(8.0f * a);
+	wc += c9 * cos(9.0f * a);
+	wc += c10 * cos(10.0f * a);
+
+	return wc;
+}
+
+#define WindowType_None		0
+#define WindowType_Rectangular  1
+#define WindowType_Bartlett 2
+#define WindowType_Welch	3
+#define WindowType_Sine		4
+#define WindowType_Hann		5
+#define WindowType_Hanning	6
+#define WindowType_Hamming	7
+#define WindowType_BH92		8
+#define WindowType_Nutall3	9
+#define WindowType_Nutall3A 10
+#define WindowType_Nutall3B 11
+#define WindowType_Nutall4	12
+#define WindowType_Nutall4A 13
+#define WindowType_Nutall4B 14
+#define WindowType_SFT3F	15
+#define WindowType_SFT4F	16
+#define WindowType_SFT5F	17
+#define WindowType_SFT3M	18
+#define WindowType_SFT4M	19
+#define WindowType_SFT5M	20
+#define WindowType_FTNI		21
+#define WindowType_FTHP		22
+#define WindowType_FTSRS	23
+#define WindowType_HFT70	24
+#define WindowType_HFT90D	25
+#define WindowType_HFT95	26
+#define WindowType_HFT116D	27
+#define WindowType_HFT144D	28
+#define WindowType_HFT169D	29
+#define WindowType_HFT196D	30
+#define WindowType_HFT223D	31
+#define WindowType_HFT248D	32
+#define WindowType_Exp		33
+#define WindowType_HannPoisson	   34
+#define WindowType_DolphChebyshev  35
+
+[numthreads(64, 1, 1)]
+void CreateWindow(uint3 id : SV_DispatchThreadID)
+{
+	uint i = id.x;
+	uint windowType = _N;
+	switch (windowType)
+	{
+	case WindowType_None:
+	case WindowType_Rectangular:	_Output[i] = 1.0f; break;
+	case WindowType_Bartlett:		_Output[i] = 2.0f / _FFTWindow * (_FFTWindow / 2.0f - abs(i - (_FFTWindow - 1.0f) / 2.0f)); break;
+	case WindowType_Welch:			_Output[i] = 1.0f - pow(((2.0f * i) / _FFTWindow) - 1.0f, 2.0f); break;
+	case WindowType_Sine:			_Output[i] = sin(UNITY_PI * i / _FFTWindow); break;
+	case WindowType_Hann:			_Output[i] = SineExpansion(i, 0.5f, -0.5f); break;
+	case WindowType_Hanning:		_Output[i] = SineExpansion(i, 0.5f, -0.5f); break;
+	case WindowType_Hamming:		_Output[i] = SineExpansion(i, 0.54f, -0.46f); break;
+	case WindowType_BH92:			_Output[i] = SineExpansion(i, 0.35875f, -0.48829f, 0.14128f, -0.01168f); break; // Also known as: Blackman-Harris
+	case WindowType_Nutall3:		_Output[i] = SineExpansion(i, 0.375f, -0.5f, 0.125f); break;
+	case WindowType_Nutall3A:		_Output[i] = SineExpansion(i, 0.40897f, -0.5f, 0.09103f); break;
+	case WindowType_Nutall3B:		_Output[i] = SineExpansion(i, 0.4243801f, -0.4973406f, 0.0782793f); break;
+	case WindowType_Nutall4:		_Output[i] = SineExpansion(i, 0.3125f, -0.46875f, 0.1875f, -0.03125f); break;
+	case WindowType_Nutall4A:		_Output[i] = SineExpansion(i, 0.338946f, -0.481973f, 0.161054f, -0.018027f); break;
+	case WindowType_Nutall4B:		_Output[i] = SineExpansion(i, 0.355768f, -0.487396f, 0.144232f, -0.012604f); break;
+	case WindowType_SFT3F:			_Output[i] = SineExpansion(i, 0.26526f, -0.5f, 0.23474f); break;
+	case WindowType_SFT4F:			_Output[i] = SineExpansion(i, 0.21706f, -0.42103f, 0.28294f, -0.07897f); break;
+	case WindowType_SFT5F:			_Output[i] = SineExpansion(i, 0.1881f, -0.36923f, 0.28702f, -0.13077f, 0.02488f); break;
+	case WindowType_SFT3M:			_Output[i] = SineExpansion(i, 0.28235f, -0.52105f, 0.19659f); break;
+	case WindowType_SFT4M:			_Output[i] = SineExpansion(i, 0.241906f, -0.460841f, 0.255381f, -0.041872f); break;
+	case WindowType_SFT5M:			_Output[i] = SineExpansion(i, 0.209671f, -0.407331f, 0.281225f, -0.092669f, 0.0091036f); break;
+	case WindowType_FTNI:			_Output[i] = SineExpansion(i, 0.2810639f, -0.5208972f, 0.1980399f); break;
+	case WindowType_FTHP:			_Output[i] = SineExpansion(i, 1.0f, -1.912510941f, 1.079173272f, -0.1832630879f); break;
+	case WindowType_HFT70:			_Output[i] = SineExpansion(i, 1.0f, -1.90796f, 1.07349f, -0.18199f); break;
+	case WindowType_FTSRS:			_Output[i] = SineExpansion(i, 1.0f, -1.93f, 1.29f, -0.388f, 0.028f); break;
+	case WindowType_HFT90D:			_Output[i] = SineExpansion(i, 1.0f, -1.942604f, 1.340318f, -0.440811f, 0.043097f); break;
+	case WindowType_HFT95:			_Output[i] = SineExpansion(i, 1.0f, -1.9383379f, 1.3045202f, -0.4028270f, 0.0350665f); break;
+	case WindowType_HFT116D:		_Output[i] = SineExpansion(i, 1.0f, -1.9575375f, 1.4780705f, -0.6367431f, 0.1228389f, -0.0066288f); break;
+	case WindowType_HFT144D:		_Output[i] = SineExpansion(i, 1.0f, -1.96760033f, 1.57983607f, -0.81123644f, 0.22583558f, -0.02773848f, 0.00090360f); break;
+	case WindowType_HFT169D:		_Output[i] = SineExpansion(i, 1.0f, -1.97441842f, 1.65409888f, -0.95788186f, 0.33673420f, -0.06364621f, 0.00521942f, -0.00010599f); break;
+	case WindowType_HFT196D:		_Output[i] = SineExpansion(i, 1.0f, -1.979280420f, 1.710288951f, -1.081629853f, 0.448734314f, -0.112376628f, 0.015122992f, -0.000871252f, 0.000011896f); break;
+	case WindowType_HFT223D:		_Output[i] = SineExpansion(i, 1.0f, -1.98298997309f, 1.75556083063f, -1.19037717712f, 0.56155440797f, -0.17296769663f, 0.03233247087f, -0.00324954578f, 0.00013801040f, -0.00000132725f); break;
+	case WindowType_HFT248D:		_Output[i] = SineExpansion(i, 1.0f, -1.985844164102f, 1.791176438506f, -1.282075284005f, 0.667777530266f, -0.240160796576f, 0.056656381764f, -0.008134974479f, 0.000624544650f, -0.000019808998f, 0.000000132974f); break;
+	case WindowType_Exp:			_Output[i] = exp(-2.0*_Scale/(8.69* _FFTWindow)*abs(i - _FFTWindow / 2.0)); break;
+	case WindowType_HannPoisson:	_Output[i] = 0.5*(1.0+cos(2.0* UNITY_PI*((float)i / _FFTWindow - 0.5)))*exp(-2.0 * _Scale / 20.0 * abs((float)i / _FFTWindow - 0.5)); break;
+	default:						break;
+	}
+}
+

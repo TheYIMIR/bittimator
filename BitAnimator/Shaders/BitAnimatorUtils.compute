@@ -1,0 +1,421 @@
+﻿
+// Copyright © 2021 Leviant. 
+// E-mail: leviant@yandex.ru  
+// Discord: Leviant#8796
+// My Discord server: https://discord.gg/MdykFMf
+// PayPal: https://paypal.me/LeviantTech
+// License: http://opensource.org/licenses/MIT
+// Version: 1.3 (01.10.2021)
+
+#pragma enable_d3d11_debug_symbols
+#pragma kernel CopyBuffer
+#pragma kernel MergeChannels2
+#pragma kernel MergeChannelsN
+#pragma kernel Transpose
+#pragma kernel Derivative
+#pragma kernel PowerKernel
+#pragma kernel ReductionSum
+#pragma kernel FinalSum
+#pragma kernel ReductionMax
+#pragma kernel FinalMax
+#pragma kernel MultiplyKernel
+#pragma kernel MultiplyBuffers
+#pragma kernel DivideKernel
+#pragma kernel PartialSumBig
+#pragma kernel PartialSumSmall
+#pragma kernel PrefixSum
+#pragma kernel PrefixSumLocal
+#pragma kernel DampingKernel
+#pragma kernel SpectrumLinearToLog
+#pragma kernel AmplitudeSmooth
+#pragma kernel FrequencySmooth
+#pragma kernel GetPeaks
+#pragma kernel BeatFinder
+
+#define TILE_DIM 32
+#define BLOCK_ROWS 8
+#define MAX_WORKSIZE 1024
+
+#include "Utils.hlsl"
+
+Buffer<float> _Input;
+RWBuffer<float> _Output;
+
+groupshared float reductionSums[MAX_WORKSIZE];
+groupshared float peaks[MAX_WORKSIZE];
+groupshared float tile[TILE_DIM][TILE_DIM + 1];
+
+uniform uint3 _GridSize;
+uniform uint _N;
+uniform uint3 _GridOffset;
+uniform uint _Channels;
+uniform uint _RealWindow;
+uniform float _Scale;
+
+[numthreads(64, 1, 1)]
+void CopyBuffer(uint3 id : SV_DispatchThreadID)
+{
+	uint i = id.y * _GridSize.x + id.x;
+	_Output[i] = _Input[i + _GridOffset.x];
+}
+
+[numthreads(64, 1, 1)]
+void MergeChannels2(uint3 id : SV_DispatchThreadID)
+{
+	uint i = id.y * _GridSize.x + id.x;
+	_Output[i] = (_Input[i * 2] + _Input[i * 2 + 1]) / 2.0f;
+}
+
+[numthreads(64, 1, 1)]
+void MergeChannelsN(uint3 id : SV_DispatchThreadID)
+{
+	uint i = id.y * _GridSize.x + id.x;
+	uint j = i * _Channels;
+	float sum = 0;
+	for (uint c = 0; c < _Channels; c++)
+		sum += _Input[j + c];
+
+	_Output[i] = sum / _Channels;
+}
+
+[numthreads(64, 1, 1)]
+void Derivative(uint3 id : SV_DispatchThreadID)
+{
+	uint i = id.y * _GridSize.x + id.x;
+	_Output[i] = _Input[i + _GridOffset.x] - _Input[i + _GridOffset.x - 1];
+}
+
+[numthreads(64, 1, 1)]
+void PowerKernel(uint3 id : SV_DispatchThreadID)
+{
+	uint i = id.y * _GridSize.x + id.x;
+	_Output[i] = pow(abs(_Input[i + _GridOffset.x]), _Scale);
+}
+
+[numthreads(64, 1, 1)]
+void SpectrumLinearToLog(uint3 id : SV_DispatchThreadID, uint3 groupID : SV_GroupID, uint3 localID : SV_GroupThreadID)
+{
+	float2 x = float2((float)id.x, id.x + 1.0) / _RealWindow; // normalized Hz
+	float2 band = _RealWindow * x * exp2(6.9 * (x - 1.0));
+	uint max_samples = ceil(band.y - band.x);
+	uint base = (_GridOffset.y + id.y) * _RealWindow + trunc(band.x);
+	float sum = 0;
+	for (uint i = 0; i < max_samples; i++)
+	{
+		sum += _Input[base + i];
+	}
+	_Output[id.y * _RealWindow + id.x] = sum / max_samples;
+}
+
+[numthreads(64, 1, 1)]
+void FrequencySmooth(int3 id : SV_DispatchThreadID)
+{
+	int begin = id.y * _GridSize.x;
+	int last = begin + (_GridSize.x - 1);
+	int i = begin + id.x - _N / 2;
+	float radius = _N / 2.0;
+	float sharpness = radius / 2.0;
+	float len_correction = 2.0 * sharpness * sharpness;
+	float correction = sqrt(UNITY_PI * len_correction);
+	float result = 0;
+	for (uint j = 0; j < _N; j++)
+	{
+		float x = j + 0.5 - radius;
+		float len = x * x;
+		result += _Input[clamp(i + j, begin, last)] * exp(-len / len_correction);
+	}
+	_Output[id.x] = result / correction;
+}
+
+[numthreads(64, 1, 1)]
+void AmplitudeSmooth(uint3 id : SV_DispatchThreadID)
+{
+	float radius = _GridSize.y / 2.0;
+	float sharpness = _Scale / 2.0;
+	float len_correction = 2.0 * sharpness * sharpness;
+	float correction = sqrt(UNITY_PI * len_correction);
+	float result = 0;
+	int size = _GridSize.y;
+	for (int row = 0; row < size; row++)
+	{
+		float x = row + 0.5 - radius;
+		float len = x * x;
+		result += _Input[row * _GridSize.x + id.x] * exp(-len / len_correction);
+	}
+	_Output[id.x] = result / correction;
+}
+
+/*
+[numthreads(TILE_DIM, BLOCK_ROWS, 1)]
+void Transpose(uint3 id : SV_DispatchThreadID, uint3 groupID : SV_GroupID, uint3 localID : SV_GroupThreadID)
+{
+	uint x = groupID.x * TILE_DIM + localID.x;
+	uint y = groupID.y * TILE_DIM + localID.y;
+	/*
+	for (uint j = 0; j < TILE_DIM; j += BLOCK_ROWS)
+		tile[localID.y + j][localID.x] = idata[(y + j)*_FFTWindow + x];
+
+	x = groupID.y * TILE_DIM + localID.x;
+	y = groupID.x * TILE_DIM + localID.y;
+
+	GroupMemoryBarrierWithGroupSync();
+
+	for (uint j = 0; j < TILE_DIM; j += BLOCK_ROWS)
+		odata[(y + j)*_FFTWindow + x] = tile[localID.x][localID.y + j];
+	//
+	for (uint j = 0; j < TILE_DIM; j += BLOCK_ROWS)
+	{
+		_Output[x*_FFTWindow + (y + j)] = _Input[(y + j)*_FFTWindow + x];
+		DeviceMemoryBarrier();
+	}
+}*/
+
+[numthreads(TILE_DIM, TILE_DIM, 1)]
+void Transpose(uint3 id : SV_DispatchThreadID, uint3 groupID : SV_GroupID, uint3 localID : SV_GroupThreadID)
+{
+	_Output[id.x* _RealWindow + id.y] = _Input[id.y* _RealWindow + id.x];
+}
+
+//Merge band
+//1 group (1024 threads) by _N chunks {_N must be power of 2}
+[numthreads(MAX_WORKSIZE, 1, 1)]
+void ReductionSum(uint3 id : SV_DispatchThreadID, uint3 groupID : SV_GroupID, uint localID : SV_GroupIndex)
+{
+	uint threadsPerChunk = MAX_WORKSIZE / _N;
+	uint chunk = id.x / threadsPerChunk;
+	uint idx = id.x % threadsPerChunk;
+	uint position = _GridOffset.x + chunk * _RealWindow + idx;
+	if (idx < _GridSize.x && chunk < _GridSize.y)
+		reductionSums[localID] = _Input[position];
+	else
+		reductionSums[localID] = 0;
+
+	for (uint offset = threadsPerChunk / 2; offset != 0; offset /= 2)
+	{
+		GroupMemoryBarrierWithGroupSync();
+		if (idx < offset)
+			reductionSums[localID] += reductionSums[localID + offset];
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	if (idx == 0 && chunk < _GridSize.y)	// the root of the reduction subtree
+		_Output[chunk] = reductionSums[localID];
+}
+
+[numthreads(MAX_WORKSIZE, 1, 1)]
+void FinalSum(uint3 id : SV_DispatchThreadID, uint3 groupID : SV_GroupID, uint localID : SV_GroupIndex)
+{
+	uint iterations = (_GridSize.x - 1) / MAX_WORKSIZE + 1;
+
+	reductionSums[localID] = 0;
+	uint base = _GridSize.x * id.y + localID;
+	for (uint j = 0; j < iterations; j++)
+	{
+		uint idx = base + j * MAX_WORKSIZE;
+		if (idx < _GridSize.x)
+			reductionSums[localID] += _Input[idx];
+	}
+
+	for (uint offset = MAX_WORKSIZE / 2; offset != 0; offset /= 2)
+	{
+		GroupMemoryBarrierWithGroupSync();	// wait for all other work-items to finish previous iteration.
+		if (localID < offset)
+			reductionSums[localID] += reductionSums[localID + offset];
+
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (localID == 0)	// the root of the reduction subtree
+		_Output[id.y] = reductionSums[0];
+}
+
+[numthreads(MAX_WORKSIZE, 1, 1)]
+void ReductionMax(uint3 id : SV_DispatchThreadID, uint3 groupID : SV_GroupID, uint localID : SV_GroupIndex)
+{
+	if (id.x < _GridSize.x)
+		reductionSums[localID] = _Input[id.x + _GridOffset.x];
+	else
+		reductionSums[localID] = -1e+100;
+
+	for (uint offset = MAX_WORKSIZE / 2; offset != 0; offset /= 2)
+	{
+		GroupMemoryBarrierWithGroupSync();	// wait for all other work-items to finish previous iteration.
+		if (localID < offset)
+			reductionSums[localID] = max(reductionSums[localID], reductionSums[localID + offset]);
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (localID == 0)	// the root of the reduction subtree
+		_Output[groupID.x] = reductionSums[0];
+}
+
+[numthreads(MAX_WORKSIZE, 1, 1)]
+void FinalMax(uint3 id : SV_DispatchThreadID, uint3 groupID : SV_GroupID, uint localID : SV_GroupIndex)
+{
+	const uint localSize = MAX_WORKSIZE;
+	uint iterations = (_GridSize.x - 1) / localSize + 1;
+
+	reductionSums[localID] = -1e+100;
+
+	for (uint j = 0; j < iterations; j++)
+	{
+		uint idx = localID + j * localSize;
+		if (idx < _GridSize.x)
+			reductionSums[localID] = max(reductionSums[localID], _Input[idx]);
+	}
+
+	for (uint offset = localSize / 2; offset != 0; offset /= 2)
+	{
+		GroupMemoryBarrierWithGroupSync();	// wait for all other work-items to finish previous iteration.
+		if (localID < offset)
+			reductionSums[localID] = max(reductionSums[localID], reductionSums[localID + offset]);
+
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (localID == 0)	// the root of the reduction subtree
+		_Output[0] = reductionSums[0];
+}
+[numthreads(64, 1, 1)]
+void MultiplyKernel(uint3 globalID : SV_DispatchThreadID)
+{
+	_Output[_GridOffset.x + globalID.x] *= _Scale;
+}
+
+[numthreads(64, 1, 1)]
+void MultiplyBuffers(uint3 id : SV_DispatchThreadID)
+{
+	_Output[id.x] *= _Input[id.x];
+}
+
+[numthreads(64, 1, 1)]
+void DivideKernel(uint3 globalID : SV_DispatchThreadID)
+{
+	_Output[_GridOffset.x + globalID.x] /= _Input[0];
+}
+//Merge band
+//1 group (1024 threads) by chunk
+[numthreads(MAX_WORKSIZE, 1, 1)]
+void PartialSumBig(uint3 id : SV_DispatchThreadID, uint localID : SV_GroupIndex)
+{
+	uint iterations = (_GridSize.x - _GridOffset.x - 1) / MAX_WORKSIZE + 1;
+	uint globalStart = id.y * _RealWindow + _GridOffset.x;
+
+	reductionSums[localID] = _Input[globalStart + id.x];
+	//sum iterations if band size > 1024 
+	for (uint j = 1; j < iterations; j++)
+	{
+		uint idx = MAX_WORKSIZE * j + id.x;
+		if (idx < _GridSize.x)
+			reductionSums[localID] += _Input[globalStart + idx];
+	}
+	//reduction sum
+	for (uint offset = MAX_WORKSIZE / 2; offset != 0; offset /= 2)
+	{
+		GroupMemoryBarrierWithGroupSync();	// wait for all other work-items to finish previous iteration.
+		if (localID < offset)
+			reductionSums[localID] += reductionSums[localID + offset];
+
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (localID == 0)	// the root of the reduction subtree
+		_Output[id.y + _GridOffset.z] = reductionSums[0];
+}
+//Merge band
+//1 thread by chunk
+[numthreads(64, 1, 1)]
+void PartialSumSmall(uint3 id : SV_DispatchThreadID, uint3 offset : SV_GroupID)
+{
+	if (id.x >= _GridSize.y)
+		return;
+
+	float sum = 0;
+	uint start = _GridOffset.x + id.x * _RealWindow;
+	uint end = start + _GridSize.x;
+	for (uint i = start; i < end; i++)
+		sum += _Input[i];
+
+	_Output[id.x + _GridOffset.z] = sum;
+}
+
+[numthreads(MAX_WORKSIZE, 1, 1)]
+void PrefixSumLocal(uint3 id : SV_DispatchThreadID, uint localID : SV_GroupIndex)
+{
+	reductionSums[localID] = _Input[_GridOffset.x + id.x];
+	//Upward Phase
+	for (uint stride = 2; stride <= MAX_WORKSIZE; stride *= 2)
+	{
+		uint dest = localID * stride;
+		uint source = localID * (stride - 1);
+		GroupMemoryBarrierWithGroupSync();
+		if (dest & stride == dest)
+			reductionSums[dest - 1] += reductionSums[source - 1];
+	}
+	//Downward phase
+	for (stride = MAX_WORKSIZE / 2; stride > 1; stride /= 2)
+	{
+		uint dest = localID * stride;
+		uint source = localID * (stride - 1);
+		GroupMemoryBarrierWithGroupSync();
+		if (dest & stride == dest)
+			reductionSums[dest - 1] += reductionSums[source - 1];
+	}
+	GroupMemoryBarrierWithGroupSync();
+	_Output[id.x] = reductionSums[localID];
+}
+//Hillis and Steele prefix sum 
+[numthreads(64, 1, 1)]
+void PrefixSum(uint3 id : SV_DispatchThreadID, uint3 offset : SV_GroupID)
+{
+	//_N - offset [1, 2, 4, ...  2^n]
+	uint i = _GridOffset.x + id.x;
+	_Output[i + _N] = _Input[i] + _Input[i + _N];
+	if (id.x < _N)
+		_Output[i] = _Input[i];
+}
+
+[numthreads(64, 1, 1)]
+void DampingKernel(uint3 id : SV_DispatchThreadID, uint3 offset : SV_GroupID)
+{
+	//_N - offset [1, 2, 4, ...  2^n]
+	uint i = _GridOffset.x + id.x;
+	float current = _Input[i + _N];
+	float trail = _Input[i] * _Scale;
+	_Output[i + _N] = max(trail, current);
+	if (id.x < _N)
+		_Output[i] = _Input[i];
+}
+
+[numthreads(MAX_WORKSIZE, 1, 1)]
+void GetPeaks(uint3 id : SV_DispatchThreadID, uint3 groupID : SV_GroupID, uint localID : SV_GroupIndex)
+{
+	//Init phase: calculate peaks
+	float value;
+	uint i = _GridOffset.x + id.x;
+	if (i < _GridSize.x)
+		value = _Input[i];
+	else
+		value = 0;
+	peaks[localID] = value * value;
+	for (uint offset = MAX_WORKSIZE / 2; offset != 0; offset /= 2)
+	{
+		GroupMemoryBarrierWithGroupSync();	// wait for all other work-items to finish previous iteration.
+		if (localID < offset)
+			peaks[localID] += peaks[localID + offset]; 
+	}
+	//Store peak in temporary _Buffer for main phase
+	if (localID == 0)
+		_Output[groupID.x] = sqrt(peaks[0] / MAX_WORKSIZE);
+}
+
+[numthreads(64, 1, 1)]	//256 _BPM range [40..295]
+void BeatFinder(uint3 id : SV_DispatchThreadID, uint localID : SV_GroupIndex)
+{
+	const float minBPS = 40.0;
+	float a1 = 2.0 * UNITY_PI * (minBPS + id.x) / 60.0 / 44100.0 * 1024.0;
+	float2 integral = 0;
+	for (uint t = 0; t < _GridSize.x; t++)
+	{
+		float2 k = float2(cos(a1 * t), sin(a1 * t));
+		integral += k * _Input[t];
+	}
+	_Output[id.x + 0] = sqrt(dot(integral, integral) / 2.0) * 2.0 / _GridSize.x;
+	_Output[id.x + 256] = atan2(integral.y, integral.x) / UNITY_PI;
+}

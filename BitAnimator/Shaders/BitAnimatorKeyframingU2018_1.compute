@@ -1,0 +1,23 @@
+﻿
+// Copyright © 2021 Leviant. 
+// E-mail: leviant@yandex.ru  
+// Discord: Leviant#8796
+// My Discord server: https://discord.gg/MdykFMf
+// PayPal: https://paypal.me/LeviantTech
+// License: http://opensource.org/licenses/MIT
+// Version: 1.3 (01.10.2021)
+
+#pragma enable_d3d11_debug_symbols
+#pragma kernel FillKeyframes
+#pragma kernel DecimateKeyframesKernel
+#pragma kernel CurveFilter
+#pragma kernel MultiplyByCurve
+#pragma kernel RemapKernel
+#pragma kernel KeyframesCreator
+#pragma kernel RemapGradientKernel
+#pragma kernel ConvertToQuaternions
+
+#define UNITY_2018_1_OR_NEWER
+#define MAX_WORKSIZE 1024
+
+#include "Keyframing.hlsl"
